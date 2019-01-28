@@ -64,6 +64,12 @@ end
 What logger to use for printing debugging and informational messages during
 operation.
 
+### logger_level
+
+**Default** `:info`
+
+Regardless of what Logger you're using, Rollbar will not proxy logs to it if its less than this particular level.
+
 ### disable_monkey_patch
 
 **Default** `false`
@@ -174,11 +180,15 @@ if `person_method` not present.
 
 ### person_username_method
 
+**Default** `nil`
+
 A string or symbol giving the name of the method on the user instance that
 returns the person's username. Gets called on the result of `person_method`.
 Ignored if `person_method` not present.
 
 ### person_email_method
+
+**Default** `nil`
 
 A string or symbol giving the name of the method on the user instance that
 returns the person's email. Gets called on the result of `person_method`.

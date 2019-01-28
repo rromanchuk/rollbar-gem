@@ -5,6 +5,7 @@ require 'rollbar/scrubbers'
 require 'rollbar/scrubbers/url'
 require 'rollbar/scrubbers/params'
 require 'rollbar/util/ip_obfuscator'
+require 'rollbar/util/ip_anonymizer'
 require 'rollbar/json'
 
 module Rollbar
@@ -62,7 +63,8 @@ module Rollbar
         :scrub_fields => Array(Rollbar.configuration.scrub_fields) + sensitive_params,
         :scrub_user => Rollbar.configuration.scrub_user,
         :scrub_password => Rollbar.configuration.scrub_password,
-        :randomize_scrub_length => Rollbar.configuration.randomize_scrub_length
+        :randomize_scrub_length => Rollbar.configuration.randomize_scrub_length,
+        :whitelist => Rollbar.configuration.scrub_whitelist
       }
 
       Rollbar::Scrubbers::URL.call(options)
@@ -72,7 +74,8 @@ module Rollbar
       options = {
         :params => params,
         :config => Rollbar.configuration.scrub_fields,
-        :extra_fields => sensitive_params
+        :extra_fields => sensitive_params,
+        :whitelist => Rollbar.configuration.scrub_whitelist
       }
       Rollbar::Scrubbers::Params.call(options)
     end
@@ -102,6 +105,16 @@ module Rollbar
           {}
         elsif sensitive_headers_list.include?(name)
           { name => Rollbar::Scrubbers.scrub_value(env[header]) }
+        elsif name == 'X-Forwarded-For' && !Rollbar.configuration.collect_user_ip
+          {}
+        elsif name == 'X-Forwarded-For' && Rollbar.configuration.collect_user_ip && Rollbar.configuration.anonymize_user_ip
+          ips = env[header].sub(" ", "").split(',')
+          ips = ips.map { |ip| Rollbar::Util::IPAnonymizer.anonymize_ip(ip) }
+          { name => ips.join(', ') }
+        elsif name == 'X-Real-Ip' && !Rollbar.configuration.collect_user_ip
+          {}
+        elsif name == 'X-Real-Ip' && Rollbar.configuration.collect_user_ip && Rollbar.configuration.anonymize_user_ip
+          { name => Rollbar::Util::IPAnonymizer.anonymize_ip(env[header]) }
         else
           { name => env[header] }
         end
@@ -112,8 +125,8 @@ module Rollbar
       forwarded_proto = env['HTTP_X_FORWARDED_PROTO'] || env['rack.url_scheme'] || ''
       scheme = forwarded_proto.split(',').first
 
-      forwarded_host = env['HTTP_X_FORWARDED_HOST'] || env['HTTP_HOST'] || env['SERVER_NAME']
-      host = forwarded_host && forwarded_host.split(',').first.strip
+      host = env['HTTP_X_FORWARDED_HOST'] || env['HTTP_HOST'] || env['SERVER_NAME'] || ''
+      host = host.split(',').first.strip unless host.empty?
 
       path = env['ORIGINAL_FULLPATH'] || env['REQUEST_URI']
       unless path.nil? || path.empty?
@@ -121,8 +134,8 @@ module Rollbar
       end
 
       port = env['HTTP_X_FORWARDED_PORT']
-      if port && !(scheme.downcase == 'http' && port.to_i == 80) && \
-         !(scheme.downcase == 'https' && port.to_i == 443) && \
+      if port && !(!scheme.nil? && scheme.downcase == 'http' && port.to_i == 80) && \
+         !(!scheme.nil? && scheme.downcase == 'https' && port.to_i == 443) && \
          !(host.include? ':')
         host = host + ':' + port
       end
@@ -131,7 +144,10 @@ module Rollbar
     end
 
     def rollbar_user_ip(env)
+      return nil unless Rollbar.configuration.collect_user_ip
       user_ip_string = (env['action_dispatch.remote_ip'] || env['HTTP_X_REAL_IP'] || x_forwarded_for_client(env['HTTP_X_FORWARDED_FOR']) || env['REMOTE_ADDR']).to_s
+
+      user_ip_string = Rollbar::Util::IPAnonymizer.anonymize_ip(user_ip_string)
 
       Rollbar::Util::IPObfuscator.obfuscate_ip(user_ip_string)
     rescue
@@ -176,7 +192,12 @@ module Rollbar
       return {} unless correct_method
       return {} unless json_request?(rack_req)
 
-      Rollbar::JSON.load(rack_req.body.read)
+      raw_body = rack_req.body.read
+      begin
+        Rollbar::JSON.load(raw_body)
+      rescue
+        raw_body
+      end
     rescue
       {}
     ensure

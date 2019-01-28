@@ -26,11 +26,13 @@ module Rollbar
     attr_reader :message
     attr_reader :exception
     attr_reader :extra
-
+    
     attr_reader :configuration
     attr_reader :scope
     attr_reader :logger
     attr_reader :notifier
+    
+    attr_reader :context
 
     def_delegators :payload, :[]
 
@@ -52,6 +54,7 @@ module Rollbar
       @scope = options[:scope]
       @payload = nil
       @notifier = options[:notifier]
+      @context = options[:context]
     end
 
     def payload
@@ -147,8 +150,7 @@ module Rollbar
       backtrace = Backtrace.new(exception,
                                 :message => message,
                                 :extra => build_extra,
-                                :configuration => configuration
-                               )
+                                :configuration => configuration)
 
       backtrace.to_h
     end
@@ -166,7 +168,12 @@ module Rollbar
     end
 
     def custom_data
-      data = configuration.custom_data_method.call
+      if configuration.custom_data_method.arity == 3
+        data = configuration.custom_data_method.call(message, exception, context)
+      else
+        data = configuration.custom_data_method.call
+      end
+      
       Rollbar::Util.deep_copy(data)
     rescue => e
       return {} if configuration.safely?

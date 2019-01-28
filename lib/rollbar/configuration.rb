@@ -12,6 +12,7 @@ module Rollbar
     attr_accessor :custom_data_method
     attr_accessor :delayed_job_enabled
     attr_accessor :default_logger
+    attr_reader :logger_level
     attr_accessor :disable_monkey_patch
     attr_accessor :disable_rack_monkey_patch
     attr_accessor :disable_core_monkey_patch
@@ -43,6 +44,9 @@ module Rollbar
     attr_accessor :scrub_fields
     attr_accessor :scrub_user
     attr_accessor :scrub_password
+    attr_accessor :scrub_whitelist
+    attr_accessor :collect_user_ip
+    attr_accessor :anonymize_user_ip
     attr_accessor :user_ip_obfuscator_secret
     attr_accessor :randomize_scrub_length
     attr_accessor :uncaught_exception_level
@@ -56,6 +60,7 @@ module Rollbar
     attr_accessor :write_to_file
     attr_reader :send_extra_frame_data
     attr_accessor :use_exception_level_filters_default
+    attr_accessor :proxy
 
     attr_reader :project_gem_paths
 
@@ -70,12 +75,13 @@ module Rollbar
       @code_version = nil
       @custom_data_method = nil
       @default_logger = lambda { ::Logger.new(STDERR) }
+      @logger_level = :info
       @delayed_job_enabled = true
       @disable_monkey_patch = false
       @disable_core_monkey_patch = false
       @disable_rack_monkey_patch = false
       @dj_threshold = 0
-      @enabled = nil  # set to true when configure is called
+      @enabled = nil # set to true when configure is called
       @endpoint = DEFAULT_ENDPOINT
       @environment = nil
       @exception_level_filters = {
@@ -89,8 +95,8 @@ module Rollbar
       @payload_options = {}
       @person_method = 'current_user'
       @person_id_method = 'id'
-      @person_username_method = 'username'
-      @person_email_method = 'email'
+      @person_username_method = nil
+      @person_email_method = nil
       @project_gems = []
       @populate_empty_backtraces = false
       @report_dj_data = true
@@ -101,10 +107,11 @@ module Rollbar
       @js_options = {}
       @scrub_fields = [:passwd, :password, :password_confirmation, :secret,
                        :confirm_password, :password_confirmation, :secret_token,
-                       :api_key, :access_token ]
+                       :api_key, :access_token, :session_id]
       @scrub_user = true
       @scrub_password = true
       @randomize_scrub_length = true
+      @scrub_whitelist = []
       @uncaught_exception_level = 'error'
       @scrub_headers = ['Authorization']
       @sidekiq_threshold = 0
@@ -118,6 +125,13 @@ module Rollbar
       @send_extra_frame_data = :none
       @project_gem_paths = []
       @use_exception_level_filters_default = false
+      @proxy = nil
+      @collect_user_ip = true
+      @anonymize_user_ip = false
+      @hooks = {
+        :on_error_response => nil, # params: response
+        :on_report_internal_error => nil, #params: exception
+      }
     end
 
     def initialize_copy(orig)
@@ -171,8 +185,17 @@ module Rollbar
       @async_handler  = Rollbar::Delay::Resque
     end
 
+    def use_shoryuken(options = {})
+      require 'rollbar/delay/shoryuken' if defined?(Shoryuken)
+
+      Rollbar::Delay::Shoryuken.queue = options[:queue] if options[:queue]
+
+      @use_async      = true
+      @async_handler  = Rollbar::Delay::Shoryuken
+    end
+
     def use_sidekiq=(value)
-      deprecation_message = "#use_sidekiq=(value) has been deprecated in favor of #use_sidekiq(options = {}). Please update your rollbar configuration."
+      deprecation_message = '#use_sidekiq=(value) has been deprecated in favor of #use_sidekiq(options = {}). Please update your rollbar configuration.'
       defined?(ActiveSupport) ? ActiveSupport::Deprecation.warn(deprecation_message) : puts(deprecation_message)
 
       value.is_a?(Hash) ? use_sidekiq(value) : use_sidekiq
@@ -191,7 +214,7 @@ module Rollbar
     end
 
     def use_sucker_punch=(value)
-      deprecation_message = "#use_sucker_punch=(value) has been deprecated in favor of #use_sucker_punch. Please update your rollbar configuration."
+      deprecation_message = '#use_sucker_punch=(value) has been deprecated in favor of #use_sucker_punch. Please update your rollbar configuration.'
       defined?(ActiveSupport) ? ActiveSupport::Deprecation.warn(deprecation_message) : puts(deprecation_message)
 
       use_sucker_punch
@@ -205,9 +228,7 @@ module Rollbar
     def project_gems=(gems)
       @project_gem_paths = gems.map do |name|
         found = Gem::Specification.each.select { |spec| name === spec.name }
-        if found.empty?
-          puts "[Rollbar] No gems found matching #{name.inspect}"
-        end
+        puts "[Rollbar] No gems found matching #{name.inspect}" if found.empty?
         found
       end.flatten.uniq.map(&:gem_dir)
     end
@@ -235,8 +256,28 @@ module Rollbar
       send(option)
     end
 
+    def logger_level=(level)
+      @logger_level = level.to_sym
+    end
+
     def logger
       @logger ||= default_logger.call
+    end
+    
+    def hook(symbol, &block)
+      if @hooks.has_key?(symbol)
+        if block_given?
+          @hooks[symbol] = block
+        else
+          @hooks[symbol]
+        end
+      else
+        raise StandardError.new "Hook :" + symbol.to_s + " is not supported by Rollbar SDK."
+      end
+    end
+    
+    def execute_hook(symbol, *args)
+      hook(symbol).call(*args) if hook(symbol).is_a?(Proc)
     end
   end
 end

@@ -1,6 +1,50 @@
 require 'spec_helper'
 require 'rollbar/middleware/js'
 
+
+shared_examples 'secure_headers' do
+  it 'renders the snippet and config in the response with nonce in script tag when SecureHeaders installed' do
+    SecureHeadersMocks::CSP.config = {
+      :opt_out? => false
+    }
+
+    _, _, response = subject.call(env)
+
+    new_body = response.body.join
+
+    expect(new_body).to include('<script type="text/javascript" nonce="lorem-ipsum-nonce">')
+    expect(new_body).to include("var _rollbarConfig = #{config[:options].to_json};")
+    expect(new_body).to include(snippet)
+  end
+
+  it 'renders the snippet in the response without nonce if SecureHeaders script_src includes \'unsafe-inline\'' do
+    SecureHeadersMocks::CSP.config = {
+      :opt_out? => false,
+      :script_src => %w('unsafe-inline')
+    }
+
+    _, _, response = subject.call(env)
+    new_body = response.body.join
+
+    expect(new_body).to include('<script type="text/javascript">')
+    expect(new_body).to include("var _rollbarConfig = #{config[:options].to_json};")
+    expect(new_body).to include(snippet)
+  end
+
+  it 'renders the snippet in the response without nonce if SecureHeaders CSP is OptOut' do
+    SecureHeadersMocks::CSP.config = {
+      :opt_out? => true
+    }
+
+    _, _, response = subject.call(env)
+    new_body = response.body.join
+
+    expect(new_body).to include('<script type="text/javascript">')
+    expect(new_body).to include("var _rollbarConfig = #{config[:options].to_json};")
+    expect(new_body).to include(snippet)
+  end
+end
+
 describe Rollbar::Middleware::Js do
   subject { described_class.new(app, config) }
 
@@ -27,6 +71,35 @@ END
   let(:minified_html) do
     <<-END
 <html><head><link rel="stylesheet" href="url" type="text/css" media="screen" /><script type="text/javascript" src="foo"></script></head><body><h1>Testing the middleware</h1></body></html>
+END
+  end
+  let(:meta_charset_html) do
+    <<-END
+<html>
+  <head>
+    <meta charset="UTF-8"/>
+    <link rel="stylesheet" href="url" type="text/css" media="screen" />
+    <script type="text/javascript" src="foo"></script>
+  </head>
+  <body>
+    <h1>Testing the middleware</h1>
+  </body>
+</html>
+END
+  end
+  let(:meta_content_html) do
+    <<-END
+<html>
+  <head>
+    <meta content="origin" id="mref" name="referrer">
+    <link rel="stylesheet" href="url" type="text/css" media="screen" />
+    <meta http-equiv="Content-Type" content="text/html; charset=utf-8"/>
+    <script type="text/javascript" src="foo"></script>
+  </head>
+  <body>
+    <h1>Testing the middleware</h1>
+  </body>
+</html>
 END
   end
   let(:snippet) { 'THIS IS THE SNIPPET' }
@@ -97,6 +170,46 @@ END
         end
       end
 
+      context 'having a html 200 resposne with meta charset tag' do
+        let(:body) { [meta_charset_html] }
+        let(:status) { 200 }
+        let(:headers) do
+          { 'Content-Type' => content_type }
+        end
+        it 'adds the config and the snippet to the response' do
+          res_status, res_headers, response = subject.call(env)
+          new_body = response.body.join
+
+          expect(new_body).to_not include('>>')
+          expect(new_body).to include(snippet)
+          expect(new_body).to include(config[:options].to_json)
+          expect(res_status).to be_eql(status)
+          expect(res_headers['Content-Type']).to be_eql(content_type)
+          meta_tag = '<meta charset="UTF-8"/>'
+          expect(new_body.index(snippet)).to be > new_body.index(meta_tag)
+        end
+      end
+
+      context 'having a html 200 resposne with meta content-type tag' do
+        let(:body) { [meta_content_html] }
+        let(:status) { 200 }
+        let(:headers) do
+          { 'Content-Type' => content_type }
+        end
+        it 'adds the config and the snippet to the response' do
+          res_status, res_headers, response = subject.call(env)
+          new_body = response.body.join
+
+          expect(new_body).to_not include('>>')
+          expect(new_body).to include(snippet)
+          expect(new_body).to include(config[:options].to_json)
+          expect(res_status).to be_eql(status)
+          expect(res_headers['Content-Type']).to be_eql(content_type)
+          meta_tag = '<meta http-equiv="Content-Type" content="text/html; charset=utf-8"/>'
+          expect(new_body.index(snippet)).to be > new_body.index(meta_tag)
+        end
+      end
+
       context 'having a html 200 response and SecureHeaders >= 3.0.0 defined' do
         let(:body) { [html] }
         let(:status) { 200 }
@@ -105,45 +218,26 @@ END
         end
 
         before do
-          Object.const_set('SecureHeaders', Module.new)
-          SecureHeaders.const_set('VERSION', '3.0.0')
-          SecureHeaders.const_set('Configuration', Module.new {
-            def self.get
-            end
-          })
-          allow(SecureHeaders).to receive(:content_security_policy_script_nonce) { 'lorem-ipsum-nonce' }
+          stub_const('::SecureHeaders', secure_headers_mock)
+          SecureHeadersMocks::CSP.config = {}
         end
 
-        after do
-          Object.send(:remove_const, 'SecureHeaders')
+        context 'with secure headers 3.0.x-3.4.x' do
+          let(:secure_headers_mock) {  SecureHeadersMocks::SecureHeaders30 }
+
+          include_examples 'secure_headers'
         end
 
-        it 'renders the snippet and config in the response with nonce in script tag when SecureHeaders installed' do
-          secure_headers_config = double(:configuration, :current_csp => {})
-          allow(SecureHeaders::Configuration).to receive(:get).and_return(secure_headers_config)
-          res_status, res_headers, response = subject.call(env)
+        context 'with secure headers 3.5' do
+          let(:secure_headers_mock) {  SecureHeadersMocks::SecureHeaders35 }
 
-          new_body = response.body.join
-
-          expect(new_body).to include('<script type="text/javascript" nonce="lorem-ipsum-nonce">')
-          expect(new_body).to include("var _rollbarConfig = #{config[:options].to_json};")
-          expect(new_body).to include(snippet)
+          include_examples 'secure_headers'
         end
 
-        it 'renders the snippet in the response without nonce if SecureHeaders script_src includes \'unsafe-inline\'' do
-          secure_headers_config = double(:configuration, :current_csp => {
-                                           :script_src => %w('unsafe-inline')
-                                         })
-          allow(SecureHeaders::Configuration).to receive(:get).and_return(secure_headers_config)
+        context 'with secure headers 6.0' do
+          let(:secure_headers_mock) {  SecureHeadersMocks::SecureHeaders60 }
 
-          res_status, res_headers, response = subject.call(env)
-          new_body = response.body.join
-
-          expect(new_body).to include('<script type="text/javascript">')
-          expect(new_body).to include("var _rollbarConfig = #{config[:options].to_json};")
-          expect(new_body).to include(snippet)
-
-          SecureHeaders.send(:remove_const, 'Configuration')
+          include_examples 'secure_headers'
         end
       end
 
@@ -155,16 +249,11 @@ END
         end
 
         before do
-          Object.const_set('SecureHeaders', Module.new)
-          SecureHeaders.const_set('VERSION', '2.4.0')
-        end
-
-        after do
-          Object.send(:remove_const, 'SecureHeaders')
+          stub_const('::SecureHeaders', ::SecureHeadersMocks::SecureHeaders20)
         end
 
         it 'renders the snippet and config in the response without nonce in script tag when too old SecureHeaders installed' do
-          res_status, res_headers, response = subject.call(env)
+          _, _, response = subject.call(env)
           new_body = response.body.join
 
           expect(new_body).to include('<script type="text/javascript">')
@@ -228,6 +317,81 @@ END
 
         before do
           allow(subject).to receive(:add_js).and_raise(StandardError.new)
+        end
+      end
+
+      context 'with person data' do
+        let(:body) { [html] }
+        let(:status) { 200 }
+        let(:headers) do
+          { 'Content-Type' => content_type }
+        end
+        let(:config) do
+          {
+            :enabled => true,
+            :options => { :foo => :bar, :payload => { :a => 42 } }
+          }
+        end
+        let(:env) do
+          {
+            'rollbar.person_data' => {
+              :id => 100,
+              :username => 'foo',
+              :email => 'foo@bar.com'
+            }
+          }
+        end
+        let(:expected_js_options) do
+          {
+            :foo => 'bar',
+            :payload => {
+              :a => 42,
+              :person => {
+                :id => 100,
+                :username => 'foo',
+                :email => 'foo@bar.com'
+              }
+            }
+          }
+        end
+
+        it 'adds the person data to the configuration' do
+          _, _, response = subject.call(env)
+          new_body = response.body.join
+
+          rollbar_config = new_body[/var _rollbarConfig = (.*);<\/script>/, 1]
+          rollbar_config = JSON.parse(rollbar_config, { :symbolize_names => true})
+
+          expect(rollbar_config).to eql(expected_js_options)
+        end
+
+        context 'when the person data is nil' do
+          let(:env) do
+            {
+              'rollbar.person_data' => nil
+            }
+          end
+
+          it 'works correctly and doesnt add anything about person data' do
+            _, _, response = subject.call(env)
+            new_body = response.body.join
+
+            expect(new_body).not_to include('person')
+          end
+
+          it 'doesnt include old data when called a second time' do
+            _, _, _ = subject.call({
+                'rollbar.person_data' => {
+                  :id => 100,
+                  :username => 'foo',
+                  :email => 'foo@bar.com'
+                }
+            })
+            _, _, response = subject.call(env)
+            new_body = response.body.join
+
+            expect(new_body).not_to include('person')
+          end
         end
       end
     end

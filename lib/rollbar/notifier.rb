@@ -8,6 +8,7 @@ require 'rollbar/delay/girl_friday'
 require 'rollbar/delay/thread'
 require 'rollbar/logger_proxy'
 require 'rollbar/item'
+require 'ostruct'
 
 module Rollbar
   # The notifier class. It has the core functionality
@@ -106,6 +107,11 @@ module Rollbar
     # will become the associated exception for the report. The last hash
     # argument will be used as the extra data for the report.
     #
+    # If the extra hash contains a symbol key :custom_data_method_context
+    # the value of the key will be used as the context for
+    # configuration.custom_data_method and will be removed from the extra
+    # hash.
+    #
     # @example
     #   begin
     #     foo = bar
@@ -122,7 +128,7 @@ module Rollbar
     def log(level, *args)
       return 'disabled' unless configuration.enabled
 
-      message, exception, extra = extract_arguments(args)
+      message, exception, extra, context = extract_arguments(args)
       use_exception_level_filters = use_exception_level_filters?(extra)
 
       return 'ignored' if ignored?(exception, use_exception_level_filters)
@@ -140,7 +146,7 @@ module Rollbar
                                      use_exception_level_filters)
 
       begin
-        report(level, message, exception, extra)
+        report(level, message, exception, extra, context)
       rescue StandardError, SystemStackError => e
         report_internal_error(e)
 
@@ -289,6 +295,10 @@ module Rollbar
       end
     end
 
+    def logger
+      @logger ||= LoggerProxy.new(configuration.logger)
+    end
+
     private
 
     def use_exception_level_filters?(options)
@@ -326,18 +336,26 @@ module Rollbar
       message = nil
       exception = nil
       extra = nil
+      context = nil
 
       args.each do |arg|
         if arg.is_a?(String)
           message = arg
         elsif arg.is_a?(Exception)
           exception = arg
+        elsif RUBY_PLATFORM == 'java' && arg.is_a?(java.lang.Throwable)
+          exception = arg
         elsif arg.is_a?(Hash)
           extra = arg
+          
+          context = extra[:custom_data_method_context]
+          extra.delete :custom_data_method_context
+          
+          extra = nil if extra.empty?
         end
       end
 
-      [message, exception, extra]
+      [message, exception, extra, context]
     end
 
     def lookup_exception_level(orig_level, exception, use_exception_level_filters)
@@ -368,14 +386,14 @@ module Rollbar
       end
     end
 
-    def report(level, message, exception, extra)
+    def report(level, message, exception, extra, context)
       unless message || exception || extra
         log_error '[Rollbar] Tried to send a report with no message, exception or extra data.'
 
         return 'error'
       end
 
-      item = build_item(level, message, exception, extra)
+      item = build_item(level, message, exception, extra, context)
 
       return 'ignored' if item.ignored?
 
@@ -393,11 +411,14 @@ module Rollbar
     # If that fails, we'll fall back to a more static failsafe response.
     def report_internal_error(exception)
       log_error '[Rollbar] Reporting internal error encountered while sending data to Rollbar.'
+      
+      configuration.execute_hook(:on_report_internal_error, exception)
 
       begin
-        item = build_item('error', nil, exception, :internal => true)
+        item = build_item('error', nil, exception, { :internal => true }, nil)
       rescue => e
         send_failsafe('build_item in exception_data', e)
+        log_error "[Rollbar] Exception: #{exception}"
         return
       end
 
@@ -405,6 +426,7 @@ module Rollbar
         process_item(item)
       rescue => e
         send_failsafe('error in process_item', e)
+        log_error "[Rollbar] Item: #{item}"
         return
       end
 
@@ -412,13 +434,14 @@ module Rollbar
         log_instance_link(item['data'])
       rescue => e
         send_failsafe('error logging instance link', e)
+        log_error "[Rollbar] Item: #{item}"
         return
       end
     end
 
     ## Payload building functions
 
-    def build_item(level, message, exception, extra)
+    def build_item(level, message, exception, extra, context)
       options = {
         :level => level,
         :message => message,
@@ -427,7 +450,8 @@ module Rollbar
         :configuration => configuration,
         :logger => logger,
         :scope => scope_object,
-        :notifier => self
+        :notifier => self,
+        :context => context
       }
 
       item = Item.new(options)
@@ -438,12 +462,13 @@ module Rollbar
 
     ## Delivery functions
 
-    def send_item_using_eventmachine(item)
+    def send_item_using_eventmachine(item, uri)
       body = item.dump
       return unless body
 
       headers = { 'X-Rollbar-Access-Token' => item['access_token'] }
-      req = EventMachine::HttpRequest.new(configuration.endpoint).post(:body => body, :head => headers)
+      options = http_proxy_for_em(uri)
+      req = EventMachine::HttpRequest.new(uri.to_s, options).post(:body => body, :head => headers)
 
       req.callback do
         if req.response_header.status == 200
@@ -463,21 +488,23 @@ module Rollbar
     def send_item(item)
       log_info '[Rollbar] Sending item'
 
-      if configuration.use_eventmachine
-        send_item_using_eventmachine(item)
-        return
-      end
-
       body = item.dump
       return unless body
 
       uri = URI.parse(configuration.endpoint)
 
+      if configuration.use_eventmachine
+        send_item_using_eventmachine(item, uri)
+        return
+      end
+
       handle_response(do_post(uri, body, item['access_token']))
     end
 
     def do_post(uri, body, access_token)
-      http = Net::HTTP.new(uri.host, uri.port)
+      proxy = http_proxy(uri)
+      http  = Net::HTTP.new(uri.host, uri.port, proxy.host, proxy.port, proxy.user, proxy.password)
+
       http.open_timeout = configuration.open_timeout
       http.read_timeout = configuration.request_timeout
 
@@ -494,6 +521,41 @@ module Rollbar
       request.add_field('X-Rollbar-Access-Token', access_token)
 
       handle_net_retries { http.request(request) }
+    end
+
+    def http_proxy_for_em(uri)
+      proxy = http_proxy(uri)
+      {
+        :proxy => {
+          :host => proxy.host,
+          :port => proxy.port,
+          :authorization => [proxy.user, proxy.password]
+        }
+      }
+    end
+
+    def http_proxy(uri)
+      @http_proxy ||= proxy_from_config || proxy_from_env(uri) || null_proxy
+    end
+
+    def proxy_from_config
+      proxy_settings = configuration.proxy
+      return nil unless proxy_settings
+
+      proxy = null_proxy
+      proxy.host = URI.parse(proxy_settings[:host]).host
+      proxy.port = proxy_settings[:port]
+      proxy.user = proxy_settings[:user]
+      proxy.password = proxy_settings[:password]
+      proxy
+    end
+
+    def proxy_from_env(uri)
+      uri.find_proxy
+    end
+
+    def null_proxy
+      Struct.new(:host, :port, :user, :password).new
     end
 
     def handle_net_retries
@@ -522,6 +584,7 @@ module Rollbar
       else
         log_warning "[Rollbar] Got unexpected status code from Rollbar api: #{response.code}"
         log_info "[Rollbar] Response: #{response.body}"
+        configuration.execute_hook(:on_error_response, response)
       end
     end
 
@@ -646,10 +709,6 @@ module Rollbar
 
       uuid_url = Util.uuid_rollbar_url(data, configuration)
       log_info "[Rollbar] Details: #{uuid_url} (only available if report was successful)"
-    end
-
-    def logger
-      @logger ||= LoggerProxy.new(configuration.logger)
     end
   end
 end

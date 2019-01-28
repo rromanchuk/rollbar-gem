@@ -3,6 +3,7 @@ require 'net/https'
 require 'socket'
 require 'thread'
 require 'uri'
+require 'open-uri'
 require 'forwardable'
 
 begin
@@ -190,6 +191,8 @@ module Rollbar
       end
     end
   end
+
+  self.root_notifier = nil
 end
 
 Rollbar.plugins.require_all

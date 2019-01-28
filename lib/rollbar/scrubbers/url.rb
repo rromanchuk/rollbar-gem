@@ -6,6 +6,8 @@ require 'rollbar/language_support'
 module Rollbar
   module Scrubbers
     class URL
+      SCRUB_ALL = :scrub_all
+
       def self.call(*args)
         new.call(*args)
       end
@@ -18,7 +20,9 @@ module Rollbar
                build_regex(options[:scrub_fields]),
                options[:scrub_user],
                options[:scrub_password],
-               options.fetch(:randomize_scrub_length, true))
+               options.fetch(:randomize_scrub_length, true),
+               options[:scrub_fields].include?(SCRUB_ALL),
+               build_whitelist_regex(options[:whitelist] || []))
       rescue => e
         Rollbar.logger.error("[Rollbar] There was an error scrubbing the url: #{e}, options: #{options.inspect}")
         url
@@ -26,12 +30,18 @@ module Rollbar
 
       private
 
-      def filter(url, regex, scrub_user, scrub_password, randomize_scrub_length)
+      def build_whitelist_regex(whitelist)
+        fields = whitelist.find_all { |f| f.is_a?(String) || f.is_a?(Symbol) }
+        return unless fields.any?
+        Regexp.new(fields.map { |val| /\A#{Regexp.escape(val.to_s)}\z/ }.join('|'))
+      end
+
+      def filter(url, regex, scrub_user, scrub_password, randomize_scrub_length, scrub_all, whitelist)
         uri = URI.parse(url)
 
         uri.user = filter_user(uri.user, scrub_user, randomize_scrub_length)
         uri.password = filter_password(uri.password, scrub_password, randomize_scrub_length)
-        uri.query = filter_query(uri.query, regex, randomize_scrub_length)
+        uri.query = filter_query(uri.query, regex, randomize_scrub_length, scrub_all, whitelist)
 
         uri.to_s
       end
@@ -52,12 +62,12 @@ module Rollbar
         scrub_password && password ? filtered_value(password, randomize_scrub_length) : password
       end
 
-      def filter_query(query, regex, randomize_scrub_length)
+      def filter_query(query, regex, randomize_scrub_length, scrub_all, whitelist)
         return query unless query
 
         params = decode_www_form(query)
 
-        encoded_query = encode_www_form(filter_query_params(params, regex, randomize_scrub_length))
+        encoded_query = encode_www_form(filter_query_params(params, regex, randomize_scrub_length, scrub_all, whitelist))
 
         # We want this to rebuild array params like foo[]=1&foo[]=2
         URI.escape(CGI.unescape(encoded_query))
@@ -71,14 +81,14 @@ module Rollbar
         URI.encode_www_form(params)
       end
 
-      def filter_query_params(params, regex, randomize_scrub_length)
+      def filter_query_params(params, regex, randomize_scrub_length, scrub_all, whitelist)
         params.map do |key, value|
-          [key, filter_key?(key, regex) ? filtered_value(value, randomize_scrub_length) : value]
+          [key, filter_key?(key, regex, scrub_all, whitelist) ? filtered_value(value, randomize_scrub_length) : value]
         end
       end
 
-      def filter_key?(key, regex)
-        !!(key =~ regex)
+      def filter_key?(key, regex, scrub_all, whitelist)
+        !(whitelist === key) && (scrub_all || regex === key)
       end
 
       def filtered_value(value, randomize_scrub_length)

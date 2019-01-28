@@ -1,10 +1,15 @@
 require 'rack'
 require 'rack/response'
 
+require 'rollbar/request_data_extractor'
+require 'rollbar/util'
+
 module Rollbar
   module Middleware
     # Middleware to inject the rollbar.js snippet into a 200 html response
     class Js
+      include Rollbar::RequestDataExtractor
+
       attr_reader :app
       attr_reader :config
 
@@ -20,7 +25,7 @@ module Rollbar
         app_result = app.call(env)
 
         begin
-          return app_result unless add_js?(env, app_result[0], app_result[1])
+          return app_result unless add_js?(env, app_result[1])
 
           response_string = add_js(env, app_result[2])
           build_response(env, app_result, response_string)
@@ -31,12 +36,14 @@ module Rollbar
         end
       end
 
+      private
+
       def enabled?
         !!config[:enabled]
       end
 
-      def add_js?(env, status, headers)
-        enabled? && status == 200 && !env[JS_IS_INJECTED_KEY] &&
+      def add_js?(env, headers)
+        enabled? && !env[JS_IS_INJECTED_KEY] &&
           html?(headers) && !attachment?(headers) && !streaming?(env)
       end
 
@@ -60,10 +67,10 @@ module Rollbar
 
         return nil unless body
 
-        head_open_end = find_end_of_head_open(body)
-        return nil unless head_open_end
+        insert_after_idx = find_insertion_point(body)
+        return nil unless insert_after_idx
 
-        build_body_with_js(env, body, head_open_end)
+        build_body_with_js(env, body, insert_after_idx)
       rescue => e
         Rollbar.log_error("[Rollbar] Rollbar.js could not be added because #{e} exception")
         nil
@@ -86,9 +93,15 @@ module Rollbar
           body[head_open_end + 1..-1]
       end
 
-      def find_end_of_head_open(body)
-        head_open = body.index(/<head\W/)
-        body.index('>', head_open) if head_open
+      def find_insertion_point(body)
+        find_end_after_regex(body, /<meta\s*charset=/i) ||
+          find_end_after_regex(body, /<meta\s*http-equiv="Content-Type"/i) ||
+          find_end_after_regex(body, /<head\W/i)
+      end
+
+      def find_end_after_regex(body, regex)
+        open_idx = body.index(regex)
+        body.index('>', open_idx) if open_idx
       end
 
       def join_body(response)
@@ -103,7 +116,20 @@ module Rollbar
       end
 
       def config_js_tag(env)
-        script_tag("var _rollbarConfig = #{config[:options].to_json};", env)
+        js_config = Rollbar::Util.deep_copy(config[:options])
+
+        add_person_data(js_config, env)
+
+        script_tag("var _rollbarConfig = #{js_config.to_json};", env)
+      end
+
+      def add_person_data(js_config, env)
+        person_data = extract_person_data_from_controller(env)
+
+        return if person_data && person_data.empty?
+
+        js_config[:payload] ||= {}
+        js_config[:payload][:person] = person_data if person_data
       end
 
       def snippet_js_tag(env)
@@ -131,9 +157,86 @@ module Rollbar
       end
 
       def append_nonce?
-        defined?(::SecureHeaders) && ::SecureHeaders.respond_to?(:content_security_policy_script_nonce) &&
-          defined?(::SecureHeaders::Configuration) &&
-          !::SecureHeaders::Configuration.get.current_csp[:script_src].to_a.include?("'unsafe-inline'")
+        secure_headers.append_nonce?
+      end
+
+      def secure_headers
+        return SecureHeadersFalse.new unless defined?(::SecureHeaders::Configuration)
+
+        config = ::SecureHeaders::Configuration
+
+        secure_headers_cls = nil
+
+        if !::SecureHeaders::respond_to?(:content_security_policy_script_nonce)
+          secure_headers_cls = SecureHeadersFalse
+        elsif config.respond_to?(:get)
+          secure_headers_cls = SecureHeaders3To5
+        elsif config.dup.respond_to?(:csp)
+          secure_headers_cls = SecureHeaders6
+        else
+          secure_headers_cls = SecureHeadersFalse
+        end
+
+          secure_headers_cls.new
+      end
+
+      class SecureHeadersResolver
+        def append_nonce?
+          csp_needs_nonce?(find_csp)
+        end
+
+        private
+
+        def find_csp
+          raise NotImplementedError
+        end
+
+        def csp_needs_nonce?(csp)
+          !opt_out?(csp) && !unsafe_inline?(csp)
+        end
+
+        def opt_out?(csp)
+          raise NotImplementedError
+        end
+
+        def unsafe_inline?(csp)
+          csp[:script_src].to_a.include?("'unsafe-inline'")
+        end
+      end
+
+      class SecureHeadersFalse < SecureHeadersResolver
+        def append_nonce?
+          false
+        end
+      end
+
+      class SecureHeaders3To5 < SecureHeadersResolver
+        private
+
+        def find_csp
+          ::SecureHeaders::Configuration.get.csp
+        end
+
+        def opt_out?(csp)
+          if csp.respond_to?(:opt_out?) && csp.opt_out?
+            csp.opt_out?
+          # secure_headers csp 3.0.x-3.4.x doesn't respond to 'opt_out?'
+          elsif defined?(::SecureHeaders::OPT_OUT) && ::SecureHeaders::OPT_OUT.is_a?(Symbol)
+            csp == ::SecureHeaders::OPT_OUT
+          end
+        end
+      end
+
+      class SecureHeaders6 < SecureHeadersResolver
+        private
+
+        def find_csp
+          ::SecureHeaders::Configuration.dup.csp
+        end
+
+        def opt_out?(csp)
+          csp.opt_out?
+        end
       end
     end
   end

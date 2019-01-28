@@ -1,15 +1,19 @@
 begin
   require 'simplecov'
-  require 'codeclimate-test-reporter'
+  require 'codacy-coverage'
+
+  SimpleCov.formatter = SimpleCov::Formatter::MultiFormatter[
+    SimpleCov::Formatter::HTMLFormatter,
+    Codacy::Formatter
+  ]
 
   SimpleCov.start do
     add_filter '/spec/'
-
-    formatter SimpleCov::Formatter::MultiFormatter.new([
-      SimpleCov::Formatter::HTMLFormatter,
-      CodeClimate::TestReporter::Formatter
-    ])
   end
+
+  # Skip Codacy when running locally, to display the Simplecov summary in the console
+  # and write an updated coverage/index.html
+  Codacy::Reporter.start if Codacy::Formatter.new.send :should_run?
 rescue LoadError
 end
 
@@ -19,6 +23,9 @@ ENV['RAILS_ENV'] = ENV['RACK_ENV'] = 'test'
 require File.expand_path('../dummyapp/config/environment', __FILE__)
 require 'rspec/rails'
 require 'database_cleaner'
+
+# Needed for rollbar-rails-runner (or anything else that doesn't have Rails.root)
+ENV['DUMMYAPP_PATH'] = "#{File.dirname(__FILE__)}/dummyapp"
 
 begin
   require 'webmock/rspec'
@@ -81,4 +88,6 @@ RSpec.configure do |config|
 
   config.infer_spec_type_from_file_location! if config.respond_to?(:infer_spec_type_from_file_location!)
   config.backtrace_exclusion_patterns = [/gems\/rspec-.*/]
+
+  config.include RSpecCommand if defined?(RSpecCommand)
 end
